@@ -128,6 +128,12 @@ class OVSeq2SeqTestMixin(unittest.TestCase):
             )
 
         tested_architectures = set(self.SUPPORTED_ARCHITECTURES)
+        # Some architectures are tested under an alias fixture name (e.g. "glm_edge_v" exercises the
+        # "glm" image-text-to-text export); include the underlying model types so they are not
+        # reported as untested.
+        tested_architectures |= {
+            TEST_NAME_TO_MODEL_TYPE[name] for name in tested_architectures if name in TEST_NAME_TO_MODEL_TYPE
+        }
         transformers_architectures = set(CONFIG_MAPPING_NAMES.keys())
         ov_architectures = {
             model_type
@@ -600,6 +606,7 @@ class OVModelForVisualCausalLMIntegrationTest(OVSeq2SeqTestMixin):
         "qwen3_5",
         "qwen3_5_moe",
         "qwen3_omni_moe",
+        "glm_edge_v",
     ]
     SUPPORT_VIDEO = ["llava_next_video", "qwen2_vl", "qwen2_5_vl", "qwen3_vl", "videochat_flash_qwen"]
     SUPPORT_AUDIO = ["qwen3_omni_moe"]
@@ -633,6 +640,7 @@ class OVModelForVisualCausalLMIntegrationTest(OVSeq2SeqTestMixin):
         "phi4mm",
         "videochat_flash_qwen",
         "gemma3n",
+        "glm_edge_v",
     ]
     IMAGE = Image.open(
         requests.get(
@@ -1144,6 +1152,16 @@ class OVModelForVisualCausalLMIntegrationTest(OVSeq2SeqTestMixin):
                 model_id, trust_remote_code=model_arch in self.REMOTE_CODE_MODELS
             )
             preprocessors = {"processor": None, "tokenizer": tokenizer, "config": config}
+        elif model_arch == "glm_edge_v":
+            # GLM-Edge-V uses a bare image processor for pixel_values and a tokenizer that carries
+            # the multimodal chat template (its AutoProcessor collapses to a tokenizer).
+            processor = AutoImageProcessor.from_pretrained(
+                model_id, trust_remote_code=model_arch in self.REMOTE_CODE_MODELS
+            )
+            tokenizer = AutoTokenizer.from_pretrained(
+                model_id, trust_remote_code=model_arch in self.REMOTE_CODE_MODELS
+            )
+            preprocessors = {"processor": processor, "tokenizer": tokenizer, "config": config}
         else:
             processor = AutoProcessor.from_pretrained(
                 model_id, trust_remote_code=model_arch in self.REMOTE_CODE_MODELS

@@ -33,6 +33,7 @@ from transformers.modeling_outputs import (
     BaseModelOutput,
     BaseModelOutputWithPast,
     BaseModelOutputWithPooling,
+    CausalLMOutputWithPast,
 )
 from transformers.models.llama.configuration_llama import LlamaConfig
 from transformers.models.llama.modeling_llama import (
@@ -3326,6 +3327,175 @@ class MiniCPMVImageEmbeddingsModelPatcher(ModelPatcher):
         if is_torch_version(">=", "2.0.0"):
             for layer in self._model.encoder.layers:
                 layer.self_attn.forward = layer.self_attn._orig_forward
+
+
+def _glm_edge_v_decoder_forward(
+    self,
+    input_ids=None,
+    images=None,
+    attention_mask=None,
+    position_ids=None,
+    past_key_values=None,
+    inputs_embeds=None,
+    use_cache=None,
+    output_attentions=None,
+    output_hidden_states=None,
+    return_dict=None,
+    cache_position=None,
+    **kwargs,
+):
+    # Text-only decoder path for GLM-Edge-V (`GlmModel`). The original forward embeds the
+    # image features into `inputs_embeds` on the prefill step; for the exported language model
+    # the merged `inputs_embeds` are produced outside the graph, so the vision branch is skipped
+    # entirely and only the transformer decoder + cache logic is traced.
+    output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
+    output_hidden_states = (
+        output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
+    )
+    use_cache = use_cache if use_cache is not None else self.config.use_cache
+    return_dict = return_dict if return_dict is not None else self.config.use_return_dict
+
+    if inputs_embeds is None:
+        inputs_embeds = self.embed_tokens(input_ids)
+
+    if use_cache and not isinstance(past_key_values, Cache):
+        past_key_values = (
+            DynamicCache() if past_key_values is None else DynamicCache.from_legacy_cache(past_key_values)
+        )
+
+    if cache_position is None:
+        past_seen_tokens = past_key_values.get_seq_length() if past_key_values is not None else 0
+        cache_position = torch.arange(
+            past_seen_tokens, past_seen_tokens + inputs_embeds.shape[1], device=inputs_embeds.device
+        )
+    if position_ids is None:
+        position_ids = cache_position.unsqueeze(0)
+
+    causal_mask = self._update_causal_mask(
+        attention_mask, inputs_embeds, cache_position, past_key_values, output_attentions
+    )
+    hidden_states = inputs_embeds
+    position_embeddings = self.rotary_emb(hidden_states, position_ids)
+
+    all_hidden_states = () if output_hidden_states else None
+    all_self_attns = () if output_attentions else None
+    next_decoder_cache = None
+
+    for decoder_layer in self.layers:
+        if output_hidden_states:
+            all_hidden_states += (hidden_states,)
+        layer_outputs = decoder_layer(
+            hidden_states,
+            attention_mask=causal_mask,
+            position_ids=position_ids,
+            past_key_value=past_key_values,
+            output_attentions=output_attentions,
+            use_cache=use_cache,
+            cache_position=cache_position,
+            position_embeddings=position_embeddings,
+        )
+        hidden_states = layer_outputs[0]
+        if use_cache:
+            next_decoder_cache = layer_outputs[2 if output_attentions else 1]
+        if output_attentions:
+            all_self_attns += (layer_outputs[1],)
+
+    hidden_states = self.norm(hidden_states)
+    if output_hidden_states:
+        all_hidden_states += (hidden_states,)
+
+    next_cache = next_decoder_cache if use_cache else None
+    if not return_dict:
+        return tuple(v for v in [hidden_states, next_cache, all_hidden_states, all_self_attns] if v is not None)
+    return BaseModelOutputWithPast(
+        last_hidden_state=hidden_states,
+        past_key_values=next_cache,
+        hidden_states=all_hidden_states,
+        attentions=all_self_attns,
+    )
+
+
+def _glm_edge_v_lm_forward(
+    self,
+    input_ids=None,
+    attention_mask=None,
+    position_ids=None,
+    past_key_values=None,
+    inputs_embeds=None,
+    use_cache=None,
+    output_attentions=None,
+    output_hidden_states=None,
+    return_dict=None,
+    cache_position=None,
+    **kwargs,
+):
+    # Language-model head path for GLM-Edge-V export: consumes `inputs_embeds` directly and skips
+    # the multimodal `pixel_values` reshape performed by the original `GlmForCausalLM.forward`.
+    return_dict = return_dict if return_dict is not None else self.config.use_return_dict
+    outputs = self.model(
+        input_ids=input_ids,
+        attention_mask=attention_mask,
+        position_ids=position_ids,
+        past_key_values=past_key_values,
+        inputs_embeds=inputs_embeds,
+        use_cache=use_cache,
+        output_attentions=output_attentions,
+        output_hidden_states=output_hidden_states,
+        return_dict=return_dict,
+        cache_position=cache_position,
+    )
+    hidden_states = outputs[0]
+    logits = self.lm_head(hidden_states)
+    if not return_dict:
+        return (logits,) + outputs[1:]
+    return CausalLMOutputWithPast(
+        loss=None,
+        logits=logits,
+        past_key_values=outputs.past_key_values,
+        hidden_states=outputs.hidden_states,
+        attentions=outputs.attentions,
+    )
+
+
+class GlmEdgeVLanguageModelPatcher(OVDecoderModelPatcher):
+    # Patch GLM-Edge-V (`GlmForCausalLM`) so the exported language model consumes pre-merged
+    # `inputs_embeds` instead of `pixel_values` + `input_ids`, keeping the vision tower out of
+    # the language graph (it is exported separately as the vision-embeddings submodel).
+    def __enter__(self):
+        self._model.__orig_forward = self._model.forward
+        self._model.model.__orig_forward = self._model.model.forward
+        self._model.forward = types.MethodType(_glm_edge_v_lm_forward, self._model)
+        self._model.model.forward = types.MethodType(_glm_edge_v_decoder_forward, self._model.model)
+        super().__enter__()
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        super().__exit__(exc_type, exc_value, traceback)
+        self._model.forward = self._model.__orig_forward
+        self._model.model.forward = self._model.model.__orig_forward
+
+
+class GlmEdgeVImageEmbeddingsModelPatcher(ModelPatcher):
+    # GLM-Edge-V (model_type "glm" with a `vision_config`) keeps its vision tower inside
+    # `GlmModel.vision`. The tower accepts a 4D pixel tensor `(num_images, channels, height, width)`
+    # and returns image embeddings (already wrapped with the begin/end-of-image markers) that are
+    # scattered into the language-model input embeddings in place of the `boi_token_id` placeholders.
+    def __init__(
+        self,
+        config: "OpenVINOConfig",
+        model: "PreTrainedModel",
+        model_kwargs: Dict[str, Any],
+    ):
+        model.__orig_forward = model.forward
+
+        def image_embed_forward(self, pixel_values):
+            return self.model.vision(pixel_values)
+
+        model.forward = types.MethodType(image_embed_forward, model)
+        super().__init__(config, model, model_kwargs)
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        super().__exit__(exc_type, exc_value, traceback)
+        self._model.forward = self._model.__orig_forward
 
 
 class LlavaQwen2ImageEmbeddingsModelPatcher(ModelPatcher):

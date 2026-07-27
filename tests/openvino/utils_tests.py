@@ -144,7 +144,330 @@ def _create_tiny_kokoro_model():
     return str(output_dir)
 
 
+# Bump when the GLM-Edge-V tiny-model construction logic or remote-code patches change so that
+# stale cached fixtures are rebuilt instead of silently reused.
+_TINY_GLM_EDGE_V_CACHE_VERSION = 1
+
+
+def _patch_tiny_glm_edge_v_remote_code(modeling_path: Path) -> None:
+    """Make the bundled GLM-Edge-V remote code compatible with recent transformers.
+
+    The upstream GLM-Edge-V remote code targets transformers ~4.44-4.47. Recent transformers
+    releases require the modern ``cache_position`` generation contract and dropped the helpers this
+    code relied on, so a few edits are applied without changing the architecture, task or vision
+    bridge:
+
+    1. drop the custom ``_update_model_kwargs_for_generation`` (calls the removed
+       ``_extract_past_from_model_output``) and the ``is_first_forward`` based
+       ``prepare_inputs_for_generation`` in favor of the standard ``GenerationMixin`` behavior;
+    2. stop re-slicing ``input_ids`` / emitting a legacy tuple cache inside ``GlmModel.forward``;
+    3. merge the image features on an empty ``Cache`` object (the upstream ``if not past_key_values``
+       gate never fires under the modern contract because the cache is always a truthy object),
+       keeping image-text generation consistent between cached and uncached decoding.
+    """
+    src = modeling_path.read_text()
+
+    old_block = '''    def _update_model_kwargs_for_generation(
+        self,
+        outputs: ModelOutput,
+        model_kwargs: Dict[str, Any],
+        is_encoder_decoder: bool = False,
+        standardize_cache_format: bool = False,
+    ) -> Dict[str, Any]:
+        # update past_key_values
+        if int(transformers_version.split(".")[1]) >= 44:
+            assert not standardize_cache_format
+            _, cache = self._extract_past_from_model_output(outputs)
+            model_kwargs["past_key_values"] = cache
+        else:
+            cache = self._extract_past_from_model_output(outputs, standardize_cache_format)
+
+        # update attention mask
+        if "attention_mask" in model_kwargs:
+            attention_mask = model_kwargs["attention_mask"]
+            model_kwargs["attention_mask"] = torch.cat(
+                [attention_mask, attention_mask.new_ones((attention_mask.shape[0], 1))], dim=-1
+            )
+
+        # update position ids
+        if "position_ids" in model_kwargs:
+            position_ids = model_kwargs["position_ids"]
+            new_position_id = position_ids[..., -1:].clone()
+            new_position_id += 1
+            model_kwargs["position_ids"] = torch.cat([position_ids, new_position_id], dim=-1)
+
+        model_kwargs["is_first_forward"] = False
+        return model_kwargs
+
+    def _create_position_ids_from_attention_mask(self, attention_mask):'''
+    new_block = '''    def _create_position_ids_from_attention_mask(self, attention_mask):'''
+    if old_block in src:
+        src = src.replace(old_block, new_block)
+
+    old_prep = '''    def prepare_inputs_for_generation(
+        self,
+        input_ids: torch.LongTensor,
+        pixel_values: Optional[torch.Tensor] = torch.zeros([1, 1, 1, 3, 672, 672]),
+        past_key_values: Optional[torch.Tensor] = None,
+        attention_mask: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.Tensor] = None,
+        use_cache: Optional[bool] = None,
+        is_first_forward: bool = True,
+        **kwargs,
+    ) -> dict:
+        if position_ids is None:
+            if attention_mask is None:
+                # Can only build sequential ids. Raise error right now
+                raise ValueError("Cannot create position ids when attention mask is None")
+            else:
+                position_ids = self._create_position_ids_from_attention_mask(attention_mask)
+        if not is_first_forward:
+            if past_key_values is not None:
+                position_ids = position_ids[..., -1:]
+                input_ids = input_ids[:, -1:]
+        return {
+            "input_ids": input_ids,
+            "pixel_values": pixel_values,
+            "past_key_values": past_key_values,
+            "position_ids": position_ids,
+            "attention_mask": attention_mask,
+            "return_last_logit": True,
+            "use_cache": use_cache,
+        }'''
+    new_prep = '''    def prepare_inputs_for_generation(
+        self,
+        input_ids: torch.LongTensor,
+        pixel_values: Optional[torch.Tensor] = None,
+        past_key_values: Optional[torch.Tensor] = None,
+        attention_mask: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.Tensor] = None,
+        use_cache: Optional[bool] = None,
+        **kwargs,
+    ) -> dict:
+        model_inputs = super().prepare_inputs_for_generation(
+            input_ids,
+            past_key_values=past_key_values,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            use_cache=use_cache,
+            **kwargs,
+        )
+        if pixel_values is not None:
+            model_inputs["pixel_values"] = pixel_values
+        return model_inputs'''
+    if old_prep in src:
+        src = src.replace(old_prep, new_prep)
+
+    old_embed = '''        if inputs_embeds is None:
+            if past_key_values:
+                inputs_embeds = self.embed_tokens(input_ids[:, -1:])
+            else:
+                inputs_embeds = self.embed_tokens(input_ids)
+
+        # kept for BC (non `Cache` `past_key_values` inputs)
+        return_legacy_cache = False
+        if use_cache and not isinstance(past_key_values, Cache):
+            return_legacy_cache = True
+            if past_key_values is None:
+                past_key_values = DynamicCache()
+            else:
+                past_key_values = DynamicCache.from_legacy_cache(past_key_values)
+                logger.warning_once(
+                    "We detected that you are passing `past_key_values` as a tuple of tuples. This is deprecated and "
+                    "will be removed in v4.47. Please convert your cache or use an appropriate `Cache` class "
+                    "(https://huggingface.co/docs/transformers/kv_cache#legacy-cache-format)"
+                )'''
+    new_embed = '''        if inputs_embeds is None:
+            inputs_embeds = self.embed_tokens(input_ids)
+
+        return_legacy_cache = False
+        if use_cache and not isinstance(past_key_values, Cache):
+            if past_key_values is None:
+                past_key_values = DynamicCache()
+            else:
+                past_key_values = DynamicCache.from_legacy_cache(past_key_values)'''
+    if old_embed in src:
+        src = src.replace(old_embed, new_embed)
+
+    old_gate = "        if not past_key_values:\n            # not allow for inputs_embeds, because we want to process image feature"
+    new_gate = (
+        "        _glm_edge_v_is_prefill = (\n"
+        "            past_key_values is None\n"
+        "            or (isinstance(past_key_values, Cache) and past_key_values.get_seq_length() == 0)\n"
+        "            or (not isinstance(past_key_values, Cache) and not past_key_values)\n"
+        "        )\n"
+        "        if _glm_edge_v_is_prefill:\n"
+        "            # not allow for inputs_embeds, because we want to process image feature"
+    )
+    if old_gate in src:
+        src = src.replace(old_gate, new_gate)
+
+    modeling_path.write_text(src)
+
+
+def _create_tiny_glm_edge_v_model():
+    """Create a tiny, architecture-faithful GLM-Edge-V (model_type ``glm``) VLM and return its path.
+
+    The GLM-Edge-V family reuses ``model_type="glm"`` (architecture ``GlmForCausalLM``) but adds a
+    SigLIP vision tower plus a conv/GLU adapter bridging into the GLM text decoder via
+    ``boi_token_id``/``eoi_token_id`` image placeholders. This builds a small random model WITHOUT
+    downloading the original weights, preserving the architecture identity, the vision->text bridge
+    token count, and the remote-code assets. The result is cached under the system temp dir.
+    """
+    from huggingface_hub import hf_hub_download
+
+    original_model_id = "zai-org/glm-edge-v-2b"
+    output_dir = Path(tempfile.gettempdir()) / "optimum_intel_tiny_random_glm_edge_v"
+    marker_file = output_dir / ".tiny_glm_edge_v_marker.json"
+    config_file = output_dir / "config.json"
+    weights_file = output_dir / "model.safetensors"
+
+    # Tiny scale parameters preserving divisibility / coupling invariants.
+    image_size, patch_size = 56, 14  # -> 4 patches/side; conv(k=2,s=2) -> 2/side -> 4 feature tokens
+    image_token_count = (image_size // patch_size // 2) ** 2 + 2  # + boi + eoi
+
+    if marker_file.exists() and config_file.exists() and weights_file.exists():
+        try:
+            marker = json.loads(marker_file.read_text())
+            saved_cfg = json.loads(config_file.read_text())
+            if (
+                marker.get("version") == _TINY_GLM_EDGE_V_CACHE_VERSION
+                and saved_cfg.get("model_type") == "glm"
+                and saved_cfg.get("architectures") == ["GlmForCausalLM"]
+                and "vision_config" in saved_cfg
+            ):
+                return str(output_dir)
+        except Exception:
+            pass
+
+    if output_dir.exists():
+        import shutil
+
+        shutil.rmtree(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    torch.manual_seed(SEED)
+
+    orig_cfg = json.loads(Path(hf_hub_download(original_model_id, "config.json")).read_text())
+
+    import shutil
+
+    for fname in (
+        "configuration_glm.py",
+        "modeling_glm.py",
+        "siglip.py",
+        "tokenizer.json",
+        "tokenizer_config.json",
+        "special_tokens_map.json",
+    ):
+        shutil.copy(hf_hub_download(original_model_id, fname), output_dir / fname)
+    _patch_tiny_glm_edge_v_remote_code(output_dir / "modeling_glm.py")
+
+    tiny_vision_config = {
+        "model_type": orig_cfg.get("vision_config", {}).get("model_type", "siglip_vision_model"),
+        "hidden_size": 64,
+        "intermediate_size": 128,
+        "num_hidden_layers": 2,
+        "num_attention_heads": 4,
+        "image_size": image_size,
+        "patch_size": patch_size,
+        "num_channels": 3,
+        "torch_dtype": "float32",
+    }
+
+    import importlib.util
+    import sys
+
+    spec = importlib.util.spec_from_file_location("tiny_glm_edge_v_config", str(output_dir / "configuration_glm.py"))
+    mod = importlib.util.module_from_spec(spec)
+    sys.modules["tiny_glm_edge_v_config"] = mod
+    spec.loader.exec_module(mod)
+    GlmConfig = mod.GlmConfig
+
+    tiny_config = GlmConfig(
+        vocab_size=orig_cfg["vocab_size"],
+        hidden_size=128,
+        intermediate_size=256,
+        num_hidden_layers=4,
+        num_attention_heads=8,
+        num_key_value_heads=2,
+        head_dim=16,
+        max_position_embeddings=1024,
+        rms_norm_eps=orig_cfg.get("rms_norm_eps", 1e-5),
+        attention_bias=orig_cfg.get("attention_bias", False),
+        rope_theta=orig_cfg.get("rope_theta", 10000.0),
+        hidden_act=orig_cfg.get("hidden_act", "silu"),
+        tie_word_embeddings=orig_cfg.get("tie_word_embeddings", True),
+        pad_token_id=orig_cfg.get("pad_token_id", 59246),
+        eos_token_id=orig_cfg.get("eos_token_id", [59246, 59253, 59255]),
+        boi_token_id=orig_cfg["boi_token_id"],
+        eoi_token_id=orig_cfg["eoi_token_id"],
+        partial_rotary_factor=orig_cfg.get("partial_rotary_factor", 1.0),
+        vision_config=tiny_vision_config,
+    )
+    tiny_config.architectures = ["GlmForCausalLM"]
+    tiny_config.auto_map = orig_cfg["auto_map"]
+    tiny_config.torch_dtype = "float32"
+    tiny_config.model_type = "glm"
+    tiny_config.save_pretrained(output_dir)
+
+    from transformers import AutoConfig, AutoModelForCausalLM
+
+    auto_cfg = AutoConfig.from_pretrained(output_dir, trust_remote_code=True)
+    auto_cfg.torch_dtype = "float32"
+    model = AutoModelForCausalLM.from_config(auto_cfg, trust_remote_code=True).to(torch.float32)
+
+    # An untrained tiny decoder collapses to a repeated token under greedy decoding; use a larger
+    # init variance so generated continuations stay diverse for HF-vs-OpenVINO comparison.
+    with torch.no_grad():
+        for name, module in model.named_modules():
+            if isinstance(module, torch.nn.Linear) and "vision" not in name and "lm_head" not in name:
+                module.weight.normal_(mean=0.0, std=0.15)
+                if module.bias is not None:
+                    module.bias.zero_()
+        emb = model.get_input_embeddings()
+        emb.weight.normal_(mean=0.0, std=0.2)
+        if emb.padding_idx is not None:
+            emb.weight[emb.padding_idx].zero_()
+
+    model.to(torch.float32).save_pretrained(output_dir, safe_serialization=True)
+
+    try:
+        shutil.copy(hf_hub_download(original_model_id, "generation_config.json"),
+                    output_dir / "generation_config.json")
+    except Exception:
+        pass
+
+    preproc = json.loads(Path(hf_hub_download(original_model_id, "preprocessor_config.json")).read_text())
+    preproc["size"] = {"height": image_size, "width": image_size}
+    (output_dir / "preprocessor_config.json").write_text(json.dumps(preproc, indent=2))
+
+    tok_cfg = json.loads((output_dir / "tokenizer_config.json").read_text())
+    boi = "<|begin_of_image|>" * image_token_count
+    tok_cfg["chat_template"] = (
+        "{% for item in messages %}{% if item['role'] != 'system' %}"
+        "<|{{ item['role'] }}|>\n{% for content in item['content'] %}"
+        "{% if content['type'] == 'image' %}" + boi + "{% elif content['type'] == 'text' %}"
+        "{{ content['text'] }}{% endif %}{% endfor %}\n{% endif %}{% endfor %}"
+        "{% if add_generation_prompt %}<|assistant|>\n{% endif %}"
+    )
+    (output_dir / "tokenizer_config.json").write_text(json.dumps(tok_cfg, indent=2))
+
+    saved_cfg = json.loads(config_file.read_text())
+    saved_cfg["torch_dtype"] = "float32"
+    saved_cfg["architectures"] = ["GlmForCausalLM"]
+    saved_cfg["auto_map"] = orig_cfg["auto_map"]
+    saved_cfg["model_type"] = "glm"
+    if isinstance(saved_cfg.get("vision_config"), dict):
+        saved_cfg["vision_config"]["torch_dtype"] = "float32"
+    config_file.write_text(json.dumps(saved_cfg, indent=2))
+
+    marker_file.write_text(json.dumps({"version": _TINY_GLM_EDGE_V_CACHE_VERSION}, indent=2))
+    return str(output_dir)
+
+
 SEED = 42
+
 
 F32_CONFIG = {"INFERENCE_PRECISION_HINT": "f32"}
 
@@ -354,6 +677,7 @@ HUB_MODEL_NAMES = {
     "xverse": "optimum-intel-internal-testing/tiny-random-xverse",
     "glm4": "optimum-intel-internal-testing/tiny-random-glm4",
     "glm": "optimum-intel-internal-testing/tiny-random-glm-edge",
+    "glm_edge_v": _create_tiny_glm_edge_v_model(),
     "open-clip": "optimum-intel-internal-testing/tiny-open-clip-model",
     "open-clip-ov": "optimum-intel-internal-testing/tiny-open-clip-model",
     "st-bert": "optimum-intel-internal-testing/all-MiniLM-L6-v2",
@@ -478,6 +802,11 @@ _ARCHITECTURES_TO_EXPECTED_INT8 = {
         "lm_model": 30,
         "text_embeddings_model": 1,
         "vision_embeddings_model": 9,
+    },
+    "glm_edge_v": {
+        "lm_model": 50,
+        "text_embeddings_model": 1,
+        "vision_embeddings_model": 18,
     },
     "llava_next": {
         "lm_model": 30,
@@ -667,6 +996,7 @@ REMOTE_CODE_MODELS = (
     "qwen3_asr",
     "fun_asr",
     "videochat_flash_qwen",
+    "glm_edge_v",
 )
 
 if is_transformers_version("<", "5"):
@@ -832,6 +1162,7 @@ TEST_NAME_TO_MODEL_TYPE = {
     "codegen2": "codegen",
     "falcon-40b": "falcon",
     "gemma4_moe": "gemma4",
+    "glm_edge_v": "glm",
     "gpt_oss_mxfp4": "gpt_oss",
     "llama_awq": "llama",
     "llava_next_mistral": "llava_next",

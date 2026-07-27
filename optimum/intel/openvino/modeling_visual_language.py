@@ -2313,6 +2313,119 @@ class _OVInternVLForCausalLM(OVModelForVisualCausalLM):
         return generation_config, model_kwargs
 
 
+class _OVGLMEdgeVForCausalLM(OVModelForVisualCausalLM):
+    """OpenVINO runtime for the GLM-Edge-V vision-language model (model_type ``glm``).
+
+    The SigLIP based vision tower (exported as the ``vision_embeddings`` submodel) turns a batch of
+    preprocessed images into image embeddings that already include the begin/end-of-image markers.
+    These embeddings replace the run of ``boi_token_id`` placeholders inside the language-model input
+    embeddings before the decoder is executed.
+    """
+
+    def get_vision_embeddings(self, pixel_values, input_ids=None, **kwargs):
+        if input_ids is not None and input_ids.shape[1] == 1:
+            return None
+        pixel_values = torch.from_numpy(pixel_values) if isinstance(pixel_values, np.ndarray) else pixel_values
+        # The GLM-Edge-V processor emits pixel_values shaped
+        # (batch, num_concurrent_media, num_tiles, channels, height, width); the vision tower expects
+        # a flat (num_images, channels, height, width) tensor.
+        if pixel_values.dim() > 4:
+            pixel_values = pixel_values.reshape(-1, *pixel_values.shape[-3:])
+        image_features = self.vision_embeddings(pixel_values).last_hidden_state
+        return image_features
+
+    def merge_vision_text_embeddings(
+        self, vision_embeds, inputs_embeds, input_ids, attention_mask, position_ids=None, **kwargs
+    ):
+        inputs_embeds = torch.from_numpy(inputs_embeds) if isinstance(inputs_embeds, np.ndarray) else inputs_embeds
+        vision_embeds = torch.from_numpy(vision_embeds) if isinstance(vision_embeds, np.ndarray) else vision_embeds
+        vision_embeds = vision_embeds.to(inputs_embeds.dtype)
+
+        B, N, C = inputs_embeds.shape
+        flat_embeds = inputs_embeds.reshape(B * N, C)
+        flat_ids = input_ids.reshape(B * N)
+        boi_token_id = self.config.boi_token_id
+        selected = flat_ids == boi_token_id
+        assert selected.sum() != 0, "No begin_of_image placeholder tokens found in the input."
+        flat_embeds[selected] = vision_embeds.reshape(-1, C).to(flat_embeds.device)
+        inputs_embeds = flat_embeds.reshape(B, N, C)
+        return inputs_embeds, attention_mask, position_ids
+
+    @staticmethod
+    def _resolve_tokenizer(processor, tokenizer):
+        # GLM-Edge-V's AutoProcessor resolves to a bare text tokenizer, so WWB may
+        # pass the tokenizer either as ``tokenizer`` or as ``processor``.
+        if tokenizer is not None:
+            return tokenizer
+        inner = getattr(processor, "tokenizer", None)
+        if inner is not None:
+            return inner
+        return processor
+
+    @staticmethod
+    def _resolve_image_processor(processor, config):
+        # WWB's load_processor attaches a dedicated image processor for VLMs whose
+        # AutoProcessor collapses to a plain tokenizer (see whowhatbench
+        # _ensure_image_processor). Prefer that attachment; otherwise fall back to
+        # the processor itself when it already is an image processor, or load one
+        # from the model config so preprocessing also works standalone.
+        image_processor = getattr(processor, "image_processor", None)
+        if image_processor is not None:
+            return image_processor
+        # A bare image processor exposes ``size`` and is callable; a plain
+        # tokenizer does not carry ``size``.
+        if processor is not None and callable(processor) and hasattr(processor, "size"):
+            return processor
+        name_or_path = getattr(config, "_name_or_path", None) if config is not None else None
+        if name_or_path:
+            return AutoImageProcessor.from_pretrained(name_or_path, trust_remote_code=True)
+        raise ValueError(
+            "GLM-Edge-V requires an image processor, but none could be resolved "
+            "from the provided processor or model config."
+        )
+
+    @staticmethod
+    def preprocess_inputs(
+        text: str,
+        image: Optional["Image"] = None,
+        processor: Optional[AutoImageProcessor] = None,
+        tokenizer: Optional[PreTrainedTokenizer] = None,
+        config: Optional[PretrainedConfig] = None,
+        video: Optional["VideoInput"] = None,
+        audio: Optional[np.ndarray] = None,
+    ):
+        if processor is None and tokenizer is None:
+            raise ValueError("Processor or tokenizer is required.")
+        if video is not None:
+            raise ValueError("Video input is not supported")
+        if audio is not None:
+            raise ValueError("Audio input is not supported")
+
+        tok = _OVGLMEdgeVForCausalLM._resolve_tokenizer(processor, tokenizer)
+        if tok is None:
+            raise ValueError("Tokenizer is required.")
+
+        if image is not None:
+            content = [{"type": "image"}, {"type": "text", "text": text}]
+        else:
+            content = [{"type": "text", "text": text}]
+        messages = [{"role": "user", "content": content}]
+        # The GLM-Edge-V chat template inserts the <|begin_of_image|> placeholder
+        # tokens (config.boi_token_id) that the vision bridge replaces with image
+        # features during the forward pass.
+        inputs = tok.apply_chat_template(
+            messages, add_generation_prompt=True, return_dict=True, tokenize=True, return_tensors="pt"
+        )
+        if image is not None:
+            image_processor = _OVGLMEdgeVForCausalLM._resolve_image_processor(processor, config)
+            # GLM-Edge-V's MllamaImageProcessor additionally emits Mllama-only tiling
+            # metadata (aspect_ratio_ids/mask, num_tiles); the vision tower consumes
+            # only the 6D ``pixel_values`` tensor, so keep just that key.
+            pixel_values = image_processor(images=image, return_tensors="pt").pixel_values
+            inputs["pixel_values"] = torch.as_tensor(pixel_values)
+        return inputs
+
+
 class _OVMiniCPMVForCausalLM(OVModelForVisualCausalLM):
     additional_parts = ["resampler"]
 
@@ -7366,6 +7479,7 @@ if is_transformers_version(">=", "5.2"):
 MODEL_TYPE_TO_CLS_MAPPING = {
     "llava": _OVLlavaForCausalLM,
     "llava_next": _OVLlavaNextForCausalLM,
+    "glm": _OVGLMEdgeVForCausalLM,
     "llava_next_video": _OVLlavaNextVideoForCausalLM,
     "minicpmv": _OVMiniCPMVForCausalLM,
     "llava-qwen2": _OVNanoLlavaForCausalLM,

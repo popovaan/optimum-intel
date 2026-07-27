@@ -1065,6 +1065,9 @@ def _get_submodels_and_export_configs(
         not custom_architecture
         and library_name == "transformers"
         and model.config.model_type in MULTI_MODAL_TEXT_GENERATION_MODELS
+        # GLM-Edge-V shares `model_type="glm"` with the text-only GLM models; only the multimodal
+        # variant (carrying a `vision_config`) uses the multi-submodel VLM export path.
+        and (model.config.model_type != "glm" or hasattr(model.config, "vision_config"))
     ):
         return _get_multi_modal_submodels_and_export_configs(
             model, task, library_name, int_dtype, float_dtype, preprocessors, model_kwargs, stateful
